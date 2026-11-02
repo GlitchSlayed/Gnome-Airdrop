@@ -1,0 +1,10 @@
+{
+  "uuid": "airdrop-gnome@vansh",
+  "name": "AirDrop for GNOME",
+  "description": "Native AirDrop sharing via Quick Settings. Powered by Owly.",
+  "version": 1,
+  "shell-version": ["50", "51"],
+  "url": "https://github.com/t4t5/owly",
+  "settings-schema": "org.gnome.shell.extensions.airdrop-gnome",
+  "gettext-domain": "airdrop-gnome"
+}

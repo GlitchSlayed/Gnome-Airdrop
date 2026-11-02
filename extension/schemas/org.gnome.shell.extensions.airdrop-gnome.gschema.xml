@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<schemalist gettext-domain="airdrop-gnome">
+  <schema id="org.gnome.shell.extensions.airdrop-gnome" path="/org/gnome/shell/extensions/airdrop-gnome/">
+    <key name="receiving-mode" type="s">
+      <default>'off'</default>
+      <summary>Receiving mode</summary>
+      <description>AirDrop receiving visibility mode: 'off', 'timed', or 'always'.</description>
+    </key>
+    <key name="receive-directory" type="s">
+      <default>''</default>
+      <summary>Download directory</summary>
+      <description>Directory for received AirDrop files. Empty defaults to XDG Downloads.</description>
+    </key>
+    <key name="exclusive-consent-given" type="b">
+      <default>false</default>
+      <summary>Exclusive Wi-Fi mode consent</summary>
+      <description>Whether user consented to Wi-Fi disconnecting during exclusive AirDrop mode.</description>
+    </key>
+    <key name="auto-restore-always-on" type="b">
+      <default>false</default>
+      <summary>Restore always-on after login</summary>
+      <description>Opt-in to restore always-on receiving mode upon login.</description>
+    </key>
+  </schema>
+</schemalist>

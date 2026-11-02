@@ -1,0 +1,31 @@
+[package]
+name = "airdrop-bridge"
+version = "0.1.0"
+edition = "2021"
+description = "Session D-Bus bridge for airdrop-gnome, wrapping Owly's CLI and radio lease"
+license = "MIT"
+
+[[bin]]
+name = "airdrop-bridge"
+path = "src/main.rs"
+
+[dependencies]
+# D-Bus (session + system bus)
+zbus = { version = "4", features = ["tokio"] }
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+# Serialization for D-Bus structs and config
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Error handling
+anyhow = "1"
+thiserror = "1"
+# XDG paths
+xdg = "2"
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+futures-util = "0.3.34"
+tokio-util = { version = "0.7.20", features = ["rt"] }
