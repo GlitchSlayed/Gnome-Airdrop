@@ -1,8 +1,4 @@
 /// dbus_bridge.rs — session D-Bus service: io.github.t4t5.AirDropGnome1
-///
-/// Exposes the extension-facing D-Bus API on the session bus.
-/// Orchestrates radio acquisition, browse/send/receive subprocesses,
-/// and the state machines defined in state.rs.
 
 use anyhow::Result;
 use std::collections::HashMap;
@@ -22,16 +18,10 @@ use crate::state::{
     TransferDirection, TransferStatus, VisibilityState,
 };
 
-// ── API version ───────────────────────────────────────────────────────────────
-
 pub const API_VERSION: u32 = 1;
 pub const BRIDGE_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-// ── Shared state handle ───────────────────────────────────────────────────────
-
 type SharedState = Arc<RwLock<BridgeState>>;
-
-// ── Internal bridge events ────────────────────────────────────────────────────
 
 #[derive(Debug)]
 enum BridgeEvent {
@@ -43,14 +33,13 @@ enum BridgeEvent {
     ReceiveEvent(owly_process::ReceiveEvent),
     MockEvent(mock::MockEvent),
     SetReceiving { mode: ReceivingMode, duration_secs: u32 },
+    BrowseRequest,
     AcceptOffer(u32),
     RejectOffer(u32),
     CancelTransfer(u32),
     StartSend { transfer_id: u32, files: Vec<String>, peer_id: String },
     Shutdown,
 }
-
-// ── D-Bus interface implementation ────────────────────────────────────────────
 
 pub struct AirDropGnomeBridge {
     state: SharedState,
@@ -59,7 +48,6 @@ pub struct AirDropGnomeBridge {
 
 #[interface(name = "io.github.t4t5.AirDropGnome1")]
 impl AirDropGnomeBridge {
-    /// Get API and bridge versions, plus capability flags.
     async fn get_version(
         &self,
     ) -> zbus::fdo::Result<(u32, String, HashMap<String, zbus::zvariant::Value<'static>>)> {
@@ -67,7 +55,6 @@ impl AirDropGnomeBridge {
         Ok((API_VERSION, BRIDGE_VERSION.to_string(), caps))
     }
 
-    /// Get the current radio and visibility state as a dict.
     async fn get_radio_state(
         &self,
     ) -> zbus::fdo::Result<HashMap<String, zbus::zvariant::Value<'static>>> {
@@ -97,7 +84,6 @@ impl AirDropGnomeBridge {
         Ok(map)
     }
 
-    /// Set receiving mode. mode: "off" | "timed" | "always"
     async fn set_receiving(
         &self,
         mode: String,
@@ -121,18 +107,16 @@ impl AirDropGnomeBridge {
         Ok(())
     }
 
-    /// Start discovery browse.
     async fn browse(&self) -> zbus::fdo::Result<()> {
+        let _ = self.event_tx.send(BridgeEvent::BrowseRequest).await;
         Ok(())
     }
 
-    /// Send files to a peer. Returns a transfer_id.
     async fn send_files(
         &self,
         files: Vec<String>,
         peer_id: String,
     ) -> zbus::fdo::Result<u32> {
-        // Validate files exist and are accessible
         for f in &files {
             if !std::path::Path::new(f).exists() {
                 return Err(zbus::fdo::Error::InvalidArgs(format!("File not found: {f}")));
@@ -156,25 +140,21 @@ impl AirDropGnomeBridge {
         Ok(transfer_id)
     }
 
-    /// Cancel an active transfer.
     async fn cancel_transfer(&self, transfer_id: u32) -> zbus::fdo::Result<()> {
         let _ = self.event_tx.send(BridgeEvent::CancelTransfer(transfer_id)).await;
         Ok(())
     }
 
-    /// Accept an incoming offer.
     async fn accept_incoming(&self, offer_id: u32) -> zbus::fdo::Result<()> {
         let _ = self.event_tx.send(BridgeEvent::AcceptOffer(offer_id)).await;
         Ok(())
     }
 
-    /// Reject an incoming offer.
     async fn reject_incoming(&self, offer_id: u32) -> zbus::fdo::Result<()> {
         let _ = self.event_tx.send(BridgeEvent::RejectOffer(offer_id)).await;
         Ok(())
     }
 
-    /// Get all active transfers as a list of dicts.
     async fn get_transfers(
         &self,
     ) -> zbus::fdo::Result<Vec<HashMap<String, zbus::zvariant::Value<'static>>>> {
@@ -186,7 +166,6 @@ impl AirDropGnomeBridge {
             .collect())
     }
 
-    /// Get peers discovered in the current browse session.
     async fn get_peers(
         &self,
     ) -> zbus::fdo::Result<Vec<HashMap<String, zbus::zvariant::Value<'static>>>> {
@@ -194,7 +173,6 @@ impl AirDropGnomeBridge {
         Ok(state.peers.values().map(peer_to_dict).collect())
     }
 
-    /// Get hardware diagnostics (redacted — no personal data).
     async fn get_diagnostics(&self) -> zbus::fdo::Result<String> {
         let state = self.state.read().await;
         if let Some(probe) = &state.probe_cache {
@@ -301,8 +279,6 @@ impl AirDropGnomeBridge {
     }
 }
 
-// ── Serialization helpers ─────────────────────────────────────────────────────
-
 fn peer_to_dict(peer: &Peer) -> HashMap<String, zbus::zvariant::Value<'static>> {
     let mut m: HashMap<String, zbus::zvariant::Value<'static>> = HashMap::new();
     m.insert("id".into(), peer.id.clone().into());
@@ -347,13 +323,10 @@ fn offer_to_dict(o: &IncomingOffer) -> HashMap<String, zbus::zvariant::Value<'st
     m
 }
 
-// ── Main run loop ─────────────────────────────────────────────────────────────
-
 pub async fn run(cfg: Config, mock_mode: bool) -> Result<()> {
     let state: SharedState = Arc::new(RwLock::new(BridgeState::default()));
     let (ev_tx, mut ev_rx) = mpsc::channel::<BridgeEvent>(64);
 
-    // Expose session D-Bus service
     let bridge_obj = AirDropGnomeBridge {
         state: state.clone(),
         event_tx: ev_tx.clone(),
@@ -372,6 +345,38 @@ pub async fn run(cfg: Config, mock_mode: bool) -> Result<()> {
         .interface::<_, AirDropGnomeBridge>("/io/github/t4t5/AirDropGnome")
         .await?;
 
+    let radio_client = if !mock_mode {
+        match RadioClient::connect().await {
+            Ok(radio) => {
+                let probe_json = radio.probe_json_redacted().await.unwrap_or_default();
+                if let Ok(probe_val) = serde_json::from_str::<serde_json::Value>(&probe_json) {
+                    state.write().await.probe_cache = Some(probe_val);
+                }
+                info!("connected to owlyd");
+
+                let ev_tx2 = ev_tx.clone();
+                let radio_arc = Arc::new(radio);
+                let radio_clone = radio_arc.clone();
+                tokio::spawn(async move {
+                    let _ = radio_clone
+                        .watch_state(move |_lease, new_state, reason| {
+                            let _ = ev_tx2.blocking_send(BridgeEvent::RadioStateChanged(
+                                new_state, reason,
+                            ));
+                        })
+                        .await;
+                });
+                Some(radio_arc)
+            }
+            Err(e) => {
+                warn!("owlyd not available: {e}; extension will show setup required state");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     if mock_mode {
         let (mock_tx, mut mock_rx) = mpsc::channel::<mock::MockEvent>(32);
         let ev_tx2 = ev_tx.clone();
@@ -383,35 +388,11 @@ pub async fn run(cfg: Config, mock_mode: bool) -> Result<()> {
                 let _ = ev_tx2.send(BridgeEvent::MockEvent(ev)).await;
             }
         });
-    } else {
-        match RadioClient::connect().await {
-            Ok(radio) => {
-                let probe_json = radio.probe_json_redacted().await.unwrap_or_default();
-                if let Ok(probe_val) = serde_json::from_str::<serde_json::Value>(&probe_json) {
-                    state.write().await.probe_cache = Some(probe_val);
-                }
-                info!("connected to owlyd");
-
-                let ev_tx2 = ev_tx.clone();
-                let radio = Arc::new(radio);
-                let radio2 = radio.clone();
-                tokio::spawn(async move {
-                    let _ = radio2
-                        .watch_state(move |_lease, new_state, reason| {
-                            let _ = ev_tx2.blocking_send(BridgeEvent::RadioStateChanged(
-                                new_state, reason,
-                            ));
-                        })
-                        .await;
-                });
-            }
-            Err(e) => {
-                warn!("owlyd not available: {e}; extension will show setup required state");
-            }
-        }
     }
 
+    let mut current_lease_id: Option<u64> = None;
     let mut receive_cancel: Option<CancellationToken> = None;
+    let mut browse_cancel: Option<CancellationToken> = None;
     let mut send_cancels: HashMap<u32, CancellationToken> = HashMap::new();
     let mut receive_accept_tx: Option<mpsc::Sender<bool>> = None;
 
@@ -451,11 +432,36 @@ pub async fn run(cfg: Config, mock_mode: bool) -> Result<()> {
                     &state,
                     &iface_ref,
                     &ev_tx,
+                    &radio_client,
+                    &mut current_lease_id,
                     &mut receive_cancel,
                     &mut receive_accept_tx,
                     mock_mode,
                 )
                 .await;
+            }
+
+            BridgeEvent::BrowseRequest => {
+                if let Some(cancel) = browse_cancel.take() {
+                    cancel.cancel();
+                }
+                let cancel = CancellationToken::new();
+                browse_cancel = Some(cancel.clone());
+                let ev_tx_browse = ev_tx.clone();
+                let iface_name = state.read().await.awdl_interface.clone().unwrap_or_else(|| "awdl0".into());
+                let display = cfg.display_name.clone();
+
+                tokio::spawn(async move {
+                    let (btx, mut brx) = mpsc::channel(16);
+                    let btx2 = btx.clone();
+                    let cancel_inner = cancel.clone();
+                    tokio::spawn(async move {
+                        let _ = owly_process::browse(&iface_name, 10, display.as_deref(), cancel_inner, btx2).await;
+                    });
+                    while let Some(bev) = brx.recv().await {
+                        let _ = ev_tx_browse.send(BridgeEvent::BrowseEvent(bev)).await;
+                    }
+                });
             }
 
             BridgeEvent::PeerAdded(peer) => {
@@ -534,6 +540,8 @@ pub async fn run(cfg: Config, mock_mode: bool) -> Result<()> {
                     &cfg,
                     &state,
                     &ev_tx,
+                    &radio_client,
+                    &mut current_lease_id,
                     &mut send_cancels,
                     mock_mode,
                 )
@@ -542,11 +550,13 @@ pub async fn run(cfg: Config, mock_mode: bool) -> Result<()> {
         }
     }
 
+    if let (Some(radio), Some(lease)) = (radio_client, current_lease_id) {
+        let _ = radio.release(lease).await;
+    }
+
     info!("bridge shutting down");
     Ok(())
 }
-
-// ── Sub-handlers ──────────────────────────────────────────────────────────────
 
 async fn handle_mock_event(
     ev: mock::MockEvent,
@@ -615,6 +625,8 @@ async fn handle_set_receiving(
     state: &SharedState,
     iface_ref: &zbus::object_server::InterfaceRef<AirDropGnomeBridge>,
     ev_tx: &mpsc::Sender<BridgeEvent>,
+    radio_client: &Option<Arc<RadioClient>>,
+    current_lease_id: &mut Option<u64>,
     receive_cancel: &mut Option<CancellationToken>,
     receive_accept_tx: &mut Option<mpsc::Sender<bool>>,
     mock_mode: bool,
@@ -624,29 +636,80 @@ async fn handle_set_receiving(
     }
     *receive_accept_tx = None;
 
-    {
-        let mut st = state.write().await;
-        let expiry = if mode == ReceivingMode::Timed && duration_secs > 0 {
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs()
-                + duration_secs as u64
-        } else {
-            0
-        };
-        st.visibility = VisibilityState {
-            mode: mode.clone(),
-            expiry,
-            active: false,
-        };
-    }
-
-    emit_radio_state(iface_ref, state).await;
-
-    if mode == ReceivingMode::Off || mock_mode {
+    if mode == ReceivingMode::Off {
+        if let (Some(radio), Some(lease)) = (radio_client.as_ref(), current_lease_id.take()) {
+            info!(lease, "releasing radio lease for receiving off");
+            let _ = radio.release(lease).await;
+        }
+        {
+            let mut st = state.write().await;
+            st.visibility = VisibilityState {
+                mode: ReceivingMode::Off,
+                expiry: 0,
+                active: false,
+            };
+            st.radio = RadioState::Idle;
+        }
+        emit_radio_state(iface_ref, state).await;
         return;
     }
+
+    if mock_mode {
+        let mut st = state.write().await;
+        st.visibility = VisibilityState {
+            mode,
+            expiry: if duration_secs > 0 { SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() + duration_secs as u64 } else { 0 },
+            active: true,
+        };
+        st.radio = RadioState::Active;
+        drop(st);
+        emit_radio_state(iface_ref, state).await;
+        return;
+    }
+
+    // Acquire lease from owlyd if not already holding one
+    if let Some(radio) = radio_client.as_ref() {
+        if current_lease_id.is_none() {
+            info!("requesting radio lease from owlyd for receiving...");
+            match radio.acquire(0).await {
+                Ok((lease, iface, _addr)) => {
+                    *current_lease_id = Some(lease);
+                    let mut st = state.write().await;
+                    st.lease_id = lease;
+                    st.awdl_interface = Some(iface);
+                    st.radio = RadioState::Active;
+                }
+                Err(e) => {
+                    error!("failed to acquire radio lease: {e}");
+                    let mut st = state.write().await;
+                    st.radio = RadioState::Error(e.to_string());
+                    drop(st);
+                    emit_radio_state(iface_ref, state).await;
+                    return;
+                }
+            }
+        }
+    }
+
+    let expiry = if mode == ReceivingMode::Timed && duration_secs > 0 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+            + duration_secs as u64
+    } else {
+        0
+    };
+
+    {
+        let mut st = state.write().await;
+        st.visibility = VisibilityState {
+            mode,
+            expiry,
+            active: true,
+        };
+    }
+    emit_radio_state(iface_ref, state).await;
 
     let awdl_iface = state
         .read()
@@ -816,6 +879,8 @@ async fn start_send(
     cfg: &Config,
     state: &SharedState,
     ev_tx: &mpsc::Sender<BridgeEvent>,
+    radio_client: &Option<Arc<RadioClient>>,
+    current_lease_id: &mut Option<u64>,
     send_cancels: &mut HashMap<u32, CancellationToken>,
     mock_mode: bool,
 ) {
@@ -856,6 +921,20 @@ async fn start_send(
 
     let cancel = CancellationToken::new();
     send_cancels.insert(transfer_id, cancel.clone());
+
+    if !mock_mode {
+        if let Some(radio) = radio_client.as_ref() {
+            if current_lease_id.is_none() {
+                if let Ok((lease, iface, _)) = radio.acquire(0).await {
+                    *current_lease_id = Some(lease);
+                    let mut st = state.write().await;
+                    st.lease_id = lease;
+                    st.awdl_interface = Some(iface);
+                    st.radio = RadioState::Active;
+                }
+            }
+        }
+    }
 
     let awdl_iface = state
         .read()

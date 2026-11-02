@@ -1,18 +1,9 @@
 /// owly_process.rs — subprocess wrappers for owly browse, send, receive
-///
-/// These functions spawn the `owly` CLI and parse its structured output.
-/// We do NOT parse localized human-readable prose; instead we rely on:
-///   - owly browse: JSON-line output per discovered peer (--json flag if available,
-///     else line-by-line structured parsing of the known stable output format)
-///   - owly send: progress lines "progress: N/TOTAL" and "done" / "rejected" / "error: ..."
-///   - owly receive: "offer: NAME FILES BYTES", "accepted", "done" etc.
-///
-/// All subprocesses are bounded (timeouts, cancellation tokens).
 
 use anyhow::{anyhow, Result};
 use std::path::Path;
 use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::process::{Child, Command};
+use tokio::process::Command;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
@@ -23,16 +14,12 @@ use crate::state::{IncomingOffer, Peer};
 
 #[derive(Debug, Clone)]
 pub enum BrowseEvent {
-    /// A peer appeared or was refreshed
     PeerFound(Peer),
-    /// Browse completed (timeout reached)
     Done,
-    /// Browse failed
     Error(String),
 }
 
 /// Run `owly browse --seconds N` and emit peers via the channel.
-/// The awdl_iface is the interface name (e.g. "awdl0").
 pub async fn browse(
     awdl_iface: &str,
     seconds: u32,
@@ -55,7 +42,9 @@ pub async fn browse(
     info!(iface = awdl_iface, seconds, "starting owly browse");
     let mut child = cmd.spawn().map_err(|e| anyhow!("owly browse spawn failed: {e}"))?;
     let stdout = child.stdout.take().unwrap();
+    let stderr = child.stderr.take().unwrap();
     let mut lines = BufReader::new(stdout).lines();
+    let mut err_lines = BufReader::new(stderr).lines();
 
     loop {
         tokio::select! {
@@ -67,19 +56,26 @@ pub async fn browse(
             line = lines.next_line() => {
                 match line {
                     Ok(Some(l)) => {
-                        debug!(line = %l, "owly browse output");
+                        debug!(line = %l, "owly browse stdout");
                         if let Some(peer) = parse_browse_line(&l) {
                             let _ = tx.send(BrowseEvent::PeerFound(peer)).await;
                         }
                     }
                     Ok(None) => {
-                        // EOF
                         let _ = tx.send(BrowseEvent::Done).await;
                         break;
                     }
                     Err(e) => {
                         let _ = tx.send(BrowseEvent::Error(e.to_string())).await;
                         break;
+                    }
+                }
+            }
+            err_line = err_lines.next_line() => {
+                if let Ok(Some(l)) = err_line {
+                    debug!(line = %l, "owly browse stderr");
+                    if let Some(peer) = parse_browse_line(&l) {
+                        let _ = tx.send(BrowseEvent::PeerFound(peer)).await;
                     }
                 }
             }
@@ -91,40 +87,64 @@ pub async fn browse(
 }
 
 /// Parse a single line from `owly browse` output.
-/// owly browse output format (stable as of 0.4.2):
+/// owly browse format:
+///   <instance_id>  "<name>"  (<addr>)
+/// or with found:
 ///   found  <name>  <service_id>  <mac>
-/// e.g.:
-///   found  iPhone  _airdrop._tcp/fa6b5071-88d9  fe80::f86b:50ff:fe71:88d9%awdl0
 fn parse_browse_line(line: &str) -> Option<Peer> {
     let line = line.trim();
-    if !line.starts_with("found") {
+    if line.is_empty() {
         return None;
     }
 
-    // Split on whitespace runs
-    let parts: Vec<&str> = line.splitn(4, char::is_whitespace)
-        .filter(|s| !s.is_empty())
-        .collect();
-
-    // parts[0] = "found", parts[1] = name, parts[2] = service_id, parts[3] = address
-    if parts.len() < 3 {
+    // Format 1: 12-char hex instance, then "Name", then (addr)
+    // Example: "3fa9c01b22de   \"Alice's iPhone\" (fe80::...)"
+    let tokens: Vec<&str> = line.split_whitespace().collect();
+    if tokens.is_empty() {
         return None;
     }
 
-    let name = parts.get(1).copied().unwrap_or("Unknown").to_string();
-    let service_id = parts.get(2).copied().unwrap_or("").to_string();
-    let mac = parts.get(3).copied().unwrap_or("").to_string();
+    if let Some(first_quote) = line.find('"') {
+        if let Some(second_quote) = line[first_quote + 1..].find('"') {
+            let name = &line[first_quote + 1..first_quote + 1 + second_quote];
+            let instance = tokens[0].trim().to_string();
+            let addr = line.rfind('(')
+                .and_then(|open| line.rfind(')').map(|close| &line[open + 1..close]))
+                .unwrap_or("")
+                .to_string();
 
-    // Derive device type from name heuristics (not trusted for security)
-    let device_type = device_type_hint(&name);
+            let device_type = device_type_hint(name);
+            return Some(Peer {
+                id: instance,
+                name: name.to_string(),
+                mac: addr,
+                device_type,
+                last_seen: Some(std::time::Instant::now()),
+            });
+        }
+    }
 
-    Some(Peer {
-        id: service_id,
-        name,
-        mac,
-        device_type,
-        last_seen: Some(std::time::Instant::now()),
-    })
+    // Format 2: "found  Name  service_id  mac"
+    if line.starts_with("found") {
+        let parts: Vec<&str> = line.splitn(4, char::is_whitespace)
+            .filter(|s| !s.is_empty())
+            .collect();
+        if parts.len() >= 3 {
+            let name = parts.get(1).copied().unwrap_or("Unknown").to_string();
+            let service_id = parts.get(2).copied().unwrap_or("").to_string();
+            let mac = parts.get(3).copied().unwrap_or("").to_string();
+            let device_type = device_type_hint(&name);
+            return Some(Peer {
+                id: service_id,
+                name,
+                mac,
+                device_type,
+                last_seen: Some(std::time::Instant::now()),
+            });
+        }
+    }
+
+    None
 }
 
 fn device_type_hint(name: &str) -> String {
@@ -144,13 +164,9 @@ fn device_type_hint(name: &str) -> String {
 
 #[derive(Debug, Clone)]
 pub enum SendEvent {
-    /// Progress update: (transferred_bytes, total_bytes)
     Progress(u64, u64),
-    /// Transfer completed successfully
     Done,
-    /// Remote rejected the transfer
     Rejected,
-    /// An error occurred
     Error(String),
 }
 
@@ -186,7 +202,7 @@ pub async fn send_files(
     let stdout = child.stdout.take().unwrap();
     let stderr = child.stderr.take().unwrap();
     let mut lines = BufReader::new(stdout).lines();
-    let _err_lines = BufReader::new(stderr).lines();
+    let mut err_lines = BufReader::new(stderr).lines();
 
     loop {
         tokio::select! {
@@ -200,22 +216,26 @@ pub async fn send_files(
                 match line {
                     Ok(Some(l)) => {
                         debug!(line = %l, "owly send stdout");
-                        match parse_send_line(&l) {
-                            Some(ev) => {
-                                let is_terminal = matches!(ev, SendEvent::Done | SendEvent::Rejected | SendEvent::Error(_));
-                                let _ = tx.send(ev).await;
-                                if is_terminal { break; }
-                            }
-                            None => {}
+                        if let Some(ev) = parse_send_line(&l) {
+                            let is_terminal = matches!(ev, SendEvent::Done | SendEvent::Rejected | SendEvent::Error(_));
+                            let _ = tx.send(ev).await;
+                            if is_terminal { break; }
                         }
                     }
-                    Ok(None) => {
-                        // EOF without explicit done/error - check exit status
-                        break;
-                    }
+                    Ok(None) => break,
                     Err(e) => {
                         let _ = tx.send(SendEvent::Error(e.to_string())).await;
                         break;
+                    }
+                }
+            }
+            err_line = err_lines.next_line() => {
+                if let Ok(Some(l)) = err_line {
+                    debug!(line = %l, "owly send stderr");
+                    if let Some(ev) = parse_send_line(&l) {
+                        let is_terminal = matches!(ev, SendEvent::Done | SendEvent::Rejected | SendEvent::Error(_));
+                        let _ = tx.send(ev).await;
+                        if is_terminal { break; }
                     }
                 }
             }
@@ -229,29 +249,27 @@ pub async fn send_files(
     Ok(())
 }
 
-/// Parse send progress/result lines.
-/// owly send output (0.4.2):
-///   "progress: 12345 / 100000"  (bytes)
-///   "done"
-///   "rejected"
-///   "error: <message>"
 fn parse_send_line(line: &str) -> Option<SendEvent> {
     let line = line.trim();
-    if line == "done" {
+    if line == "done" || line == "delivered" {
         return Some(SendEvent::Done);
     }
-    if line == "rejected" {
+    if line == "rejected" || line == "declined" {
         return Some(SendEvent::Rejected);
+    }
+    if let Some(rest) = line.strip_prefix("failed:") {
+        return Some(SendEvent::Error(rest.trim().to_string()));
     }
     if let Some(rest) = line.strip_prefix("error:") {
         return Some(SendEvent::Error(rest.trim().to_string()));
     }
-    if let Some(rest) = line.strip_prefix("progress:") {
-        // "12345 / 100000"
-        let parts: Vec<&str> = rest.split('/').collect();
+    if line.contains("bytes") && line.contains('/') {
+        // "12345 / 100000 bytes"
+        let parts: Vec<&str> = line.split('/').collect();
         if parts.len() == 2 {
             let sent = parts[0].trim().parse::<u64>().ok()?;
-            let total = parts[1].trim().parse::<u64>().ok()?;
+            let total_part = parts[1].trim().trim_end_matches("bytes").trim();
+            let total = total_part.parse::<u64>().ok()?;
             return Some(SendEvent::Progress(sent, total));
         }
     }
@@ -262,32 +280,14 @@ fn parse_send_line(line: &str) -> Option<SendEvent> {
 
 #[derive(Debug, Clone)]
 pub enum ReceiveEvent {
-    /// An incoming offer arrived
     Offer(IncomingOffer),
-    /// An offer was accepted (offer_id, dest_path)
     Accepted(u32, String),
-    /// Progress on an accepted transfer
     Progress(u32, u64, u64),
-    /// Transfer completed
     Done(u32),
-    /// Error
     Error(String),
 }
 
-/// Handle for the running receive process, with a channel to accept/reject offers.
-pub struct ReceiveHandle {
-    pub child: Child,
-    pub events: mpsc::Receiver<ReceiveEvent>,
-    pub next_offer_id: u32,
-}
-
-/// Start `owly receive --dir <dir>` and return a handle.
-/// The process runs until cancelled.
-/// IMPORTANT: owly receive with `--accept` accepts everything automatically.
-/// We do NOT pass --accept; instead we parse "offer:" lines and wait for
-/// our AcceptIncoming D-Bus call before writing to disk (controlled via stdin).
-///
-/// Note: owly 0.4.2 receive reads 'y'/'n' on stdin per offer.
+/// Start `owly receive --dir <dir>`
 pub async fn start_receive(
     awdl_iface: &str,
     dest_dir: &Path,
@@ -313,11 +313,12 @@ pub async fn start_receive(
     let mut child = cmd.spawn().map_err(|e| anyhow!("owly receive spawn failed: {e}"))?;
 
     let stdout = child.stdout.take().unwrap();
+    let stderr = child.stderr.take().unwrap();
     let stdin = child.stdin.take().unwrap();
     let (ev_tx, ev_rx) = mpsc::channel::<ReceiveEvent>(32);
     let (accept_tx, mut accept_rx) = mpsc::channel::<bool>(8);
 
-    // Spawn stdin writer task (responds to Accept/Reject signals)
+    // Stdin writer for Accept/Reject
     tokio::spawn(async move {
         use tokio::io::AsyncWriteExt;
         let mut stdin = stdin;
@@ -327,11 +328,13 @@ pub async fn start_receive(
         }
     });
 
-    // Spawn stdout reader task
+    // Stdout & Stderr reader
     let ev_tx2 = ev_tx.clone();
     tokio::spawn(async move {
         let mut lines = BufReader::new(stdout).lines();
+        let mut err_lines = BufReader::new(stderr).lines();
         let mut offer_counter = 0u32;
+
         loop {
             tokio::select! {
                 _ = cancel.cancelled() => {
@@ -354,6 +357,18 @@ pub async fn start_receive(
                         }
                     }
                 }
+                err_line = err_lines.next_line() => {
+                    match err_line {
+                        Ok(Some(l)) => {
+                            debug!(line = %l, "owly receive stderr");
+                            if let Some(ev) = parse_receive_line(&l, &mut offer_counter) {
+                                let _ = ev_tx2.send(ev).await;
+                            }
+                        }
+                        Ok(None) => break,
+                        Err(_) => break,
+                    }
+                }
             }
         }
         let _ = child.wait().await;
@@ -362,57 +377,32 @@ pub async fn start_receive(
     Ok((ev_rx, accept_tx))
 }
 
-/// Parse receive output lines.
-/// owly receive output (0.4.2):
-///   "offer: <sender_name> [file1, file2, ...] <total_bytes>"
-///   "accepted"  (after we write 'y' to stdin)
-///   "progress: <offer_id> <sent> / <total>"
-///   "done: <offer_id> <dest_path>"
-///   "error: <message>"
 fn parse_receive_line(line: &str, offer_counter: &mut u32) -> Option<ReceiveEvent> {
     let line = line.trim();
 
-    if let Some(rest) = line.strip_prefix("offer:") {
+    // Check for "wants to send:"
+    if line.contains("wants to send:") {
         *offer_counter += 1;
         let id = *offer_counter;
-        // Parse: "SenderName file1.jpg,file2.png 12345"
-        // Split from end: last token = bytes, second-to-last = files, rest = name
-        let parts: Vec<&str> = rest.trim().rsplitn(3, ' ').collect();
-        let total_bytes = parts.first().and_then(|s| s.parse().ok()).unwrap_or(0u64);
-        let file_list = parts.get(1).copied().unwrap_or("").to_string();
-        let sender_name = parts.get(2).copied().unwrap_or("Unknown").trim().to_string();
-        let file_names: Vec<String> = file_list.split(',')
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect();
+        let sender_name = if let Some(first_quote) = line.find('"') {
+            if let Some(second_quote) = line[first_quote + 1..].find('"') {
+                line[first_quote + 1..first_quote + 1 + second_quote].to_string()
+            } else {
+                "Nearby Device".to_string()
+            }
+        } else {
+            "Nearby Device".to_string()
+        };
 
         return Some(ReceiveEvent::Offer(IncomingOffer {
             offer_id: id,
             sender_name,
-            file_names,
-            total_bytes,
+            file_names: vec!["File transfer".into()],
+            total_bytes: 0,
         }));
     }
 
-    if let Some(rest) = line.strip_prefix("done:") {
-        let parts: Vec<&str> = rest.trim().splitn(2, ' ').collect();
-        let offer_id = parts.first().and_then(|s| s.parse().ok()).unwrap_or(*offer_counter);
-        let dest = parts.get(1).copied().unwrap_or("").to_string();
-        return Some(ReceiveEvent::Done(offer_id));
-    }
-
-    if let Some(rest) = line.strip_prefix("progress:") {
-        // "offer_id sent / total"
-        let parts: Vec<&str> = rest.trim().splitn(3, ' ').collect();
-        let offer_id = parts.first().and_then(|s| s.parse().ok()).unwrap_or(*offer_counter);
-        if let (Some(sent_str), Some(total_str)) = (parts.get(1), parts.get(2)) {
-            let sent = sent_str.trim_end_matches('/').trim().parse().unwrap_or(0u64);
-            let total = total_str.trim_start_matches('/').trim().parse().unwrap_or(0u64);
-            return Some(ReceiveEvent::Progress(offer_id, sent, total));
-        }
-    }
-
-    if let Some(rest) = line.strip_prefix("error:") {
+    if let Some(rest) = line.strip_prefix("transfer failed:") {
         return Some(ReceiveEvent::Error(rest.trim().to_string()));
     }
 
