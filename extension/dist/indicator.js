@@ -7,12 +7,14 @@ import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import { AirDropProxy, AIRDROP_BUS_NAME, AIRDROP_OBJECT_PATH } from './dbus.js';
 export const AirDropToggle = GObject.registerClass(class AirDropToggle extends QuickSettings.QuickMenuToggle {
     _init(extension) {
+        this._extension = extension;
+        const iconPath = extension.path + '/icons/airdrop-symbolic.svg';
+        const airdropGIcon = Gio.icon_new_for_string(iconPath);
         super._init({
             title: 'AirDrop',
             subtitle: 'Off',
-            iconName: 'network-wireless-symbolic',
+            gicon: airdropGIcon,
         });
-        this._extension = extension;
         this._settings = extension.getSettings();
         this._peers = new Map();
         this._transfers = new Map();
@@ -20,7 +22,7 @@ export const AirDropToggle = GObject.registerClass(class AirDropToggle extends Q
         this._proxySignals = [];
         this._consentDialog = null;
         // Header icon and title
-        this.menu.setHeader('network-wireless-symbolic', 'AirDrop');
+        this.menu.setHeader(airdropGIcon, 'AirDrop');
         this._buildMenu();
         this._connectProxy();
     }
@@ -60,17 +62,29 @@ export const AirDropToggle = GObject.registerClass(class AirDropToggle extends Q
         this._transfersSection = new PopupMenu.PopupMenuSection();
         this.menu.addMenuItem(this._transfersSection);
         this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
-        // 6. Footer: Open Downloads & Preferences
+        // 6. Footer Actions: Open Downloads & Settings
         const openFolderItem = new PopupMenu.PopupMenuItem('Open Received Files');
         openFolderItem.connect('activate', () => {
             try {
-                Gio.AppInfo.launch_default_for_uri('file://' + GLib.get_user_special_dir(GLib.UserDirectory.DIRECTORY_DOWNLOAD), null);
+                const customDir = this._settings.get_string('receive-directory');
+                const dir = customDir && customDir.length > 0 ? customDir : GLib.get_user_special_dir(GLib.UserDirectory.DIRECTORY_DOWNLOAD);
+                Gio.AppInfo.launch_default_for_uri('file://' + dir, null);
             }
             catch (e) {
                 console.error(`AirDrop: Failed to open Downloads: ${e}`);
             }
         });
         this.menu.addMenuItem(openFolderItem);
+        const settingsItem = new PopupMenu.PopupMenuItem('AirDrop Settings…');
+        settingsItem.connect('activate', () => {
+            try {
+                this._extension.openPreferences();
+            }
+            catch (e) {
+                console.error(`AirDrop: Failed to open preferences: ${e}`);
+            }
+        });
+        this.menu.addMenuItem(settingsItem);
     }
     _connectProxy() {
         try {
@@ -214,7 +228,9 @@ export const AirDropToggle = GObject.registerClass(class AirDropToggle extends Q
         const files = offerMap['file_names'] ? offerMap['file_names'].deepUnpack() : 'file(s)';
         const totalBytes = offerMap['total_bytes'] ? offerMap['total_bytes'].deepUnpack() : 0;
         const sizeStr = totalBytes > 0 ? ` (${(totalBytes / 1048576).toFixed(1)} MB)` : '';
-        Main.notify('AirDrop Incoming Transfer', `${sender} wants to share ${files}${sizeStr}.\nAccept transfer?`);
+        if (this._settings.get_boolean('notify-on-discover')) {
+            Main.notify('AirDrop Incoming Transfer', `${sender} wants to share ${files}${sizeStr}.\nAccept transfer?`);
+        }
         // Create interactive UI item in menu
         const item = new PopupMenu.PopupMenuItem(`Accept from ${sender} (${files})`);
         item.connect('activate', () => {
@@ -248,7 +264,9 @@ export const AirDropToggle = GObject.registerClass(class AirDropToggle extends Q
             this._transfers.get(id).destroy();
             this._transfers.delete(id);
         }
-        Main.notify('AirDrop Transfer Complete', `Successfully completed transfer with ${peerName}.`);
+        if (this._settings.get_boolean('notify-on-discover')) {
+            Main.notify('AirDrop Transfer Complete', `Successfully completed transfer with ${peerName}.`);
+        }
     }
     _onTransferFailed(t) {
         const id = t['id'] ? t['id'].deepUnpack() : 0;
@@ -276,7 +294,6 @@ export const AirDropToggle = GObject.registerClass(class AirDropToggle extends Q
         this._applyReceivingMode(mode, duration);
     }
     _promptExclusiveConsent(onConsent) {
-        // Show notification/banner asking for user consent before Wi-Fi disconnects
         Main.notify('AirDrop: Exclusive Radio Mode', 'Starting AirDrop will temporarily disconnect your regular Wi-Fi on this adapter. Wi-Fi will be restored when AirDrop is turned off.');
         this._settings.set_boolean('exclusive-consent-given', true);
         onConsent();
@@ -342,9 +359,10 @@ export const AirDropToggle = GObject.registerClass(class AirDropToggle extends Q
 export const AirDropIndicator = GObject.registerClass(class AirDropIndicator extends QuickSettings.SystemIndicator {
     _init(extension) {
         super._init();
+        const airdropGIcon = Gio.icon_new_for_string(extension.path + '/icons/airdrop-symbolic.svg');
         this._indicator = this._addIndicator();
         this._indicator.visible = false;
-        this._indicator.iconName = 'network-wireless-symbolic';
+        this._indicator.gicon = airdropGIcon;
         this._toggle = new AirDropToggle(extension);
         this.quickSettingsItems.push(this._toggle);
     }

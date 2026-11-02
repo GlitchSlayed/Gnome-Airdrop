@@ -6,6 +6,11 @@
       <summary>Receiving mode</summary>
       <description>AirDrop receiving visibility mode: 'off', 'timed', or 'always'.</description>
     </key>
+    <key name="display-name" type="s">
+      <default>''</default>
+      <summary>Custom AirDrop device name</summary>
+      <description>Custom name shown to nearby AirDrop senders. Empty uses system hostname.</description>
+    </key>
     <key name="receive-directory" type="s">
       <default>''</default>
       <summary>Download directory</summary>
@@ -20,6 +25,11 @@
       <default>false</default>
       <summary>Restore always-on after login</summary>
       <description>Opt-in to restore always-on receiving mode upon login.</description>
+    </key>
+    <key name="notify-on-discover" type="b">
+      <default>true</default>
+      <summary>Notify on incoming transfer</summary>
+      <description>Show desktop notifications for incoming file transfer requests.</description>
     </key>
   </schema>
 </schemalist>
