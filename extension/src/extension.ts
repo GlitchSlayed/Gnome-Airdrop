@@ -3,6 +3,8 @@ import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import { AirDropIndicator } from './indicator.js';
 
 export default class AirDropExtension extends Extension {
+  private _indicator: any = null;
+
   enable() {
     this._indicator = new AirDropIndicator(this);
     Main.panel.statusArea.quickSettings.addExternalIndicator(this._indicator);

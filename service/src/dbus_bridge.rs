@@ -43,7 +43,7 @@ enum BridgeEvent {
 
 pub struct AirDropGnomeBridge {
     state: SharedState,
-    event_tx: mpsc::Sender<BridgeEvent>,
+    event_tx: mpsc::UnboundedSender<BridgeEvent>,
 }
 
 #[interface(name = "io.github.t4t5.AirDropGnome1")]
@@ -102,13 +102,12 @@ impl AirDropGnomeBridge {
             .send(BridgeEvent::SetReceiving {
                 mode: recv_mode,
                 duration_secs,
-            })
-            .await;
+            });
         Ok(())
     }
 
     async fn browse(&self) -> zbus::fdo::Result<()> {
-        let _ = self.event_tx.send(BridgeEvent::BrowseRequest).await;
+        let _ = self.event_tx.send(BridgeEvent::BrowseRequest);
         Ok(())
     }
 
@@ -134,24 +133,23 @@ impl AirDropGnomeBridge {
                 transfer_id,
                 files,
                 peer_id,
-            })
-            .await;
+            });
 
         Ok(transfer_id)
     }
 
     async fn cancel_transfer(&self, transfer_id: u32) -> zbus::fdo::Result<()> {
-        let _ = self.event_tx.send(BridgeEvent::CancelTransfer(transfer_id)).await;
+        let _ = self.event_tx.send(BridgeEvent::CancelTransfer(transfer_id));
         Ok(())
     }
 
     async fn accept_incoming(&self, offer_id: u32) -> zbus::fdo::Result<()> {
-        let _ = self.event_tx.send(BridgeEvent::AcceptOffer(offer_id)).await;
+        let _ = self.event_tx.send(BridgeEvent::AcceptOffer(offer_id));
         Ok(())
     }
 
     async fn reject_incoming(&self, offer_id: u32) -> zbus::fdo::Result<()> {
-        let _ = self.event_tx.send(BridgeEvent::RejectOffer(offer_id)).await;
+        let _ = self.event_tx.send(BridgeEvent::RejectOffer(offer_id));
         Ok(())
     }
 
@@ -325,7 +323,7 @@ fn offer_to_dict(o: &IncomingOffer) -> HashMap<String, zbus::zvariant::Value<'st
 
 pub async fn run(cfg: Config, mock_mode: bool) -> Result<()> {
     let state: SharedState = Arc::new(RwLock::new(BridgeState::default()));
-    let (ev_tx, mut ev_rx) = mpsc::channel::<BridgeEvent>(64);
+    let (ev_tx, mut ev_rx) = mpsc::unbounded_channel::<BridgeEvent>();
 
     let bridge_obj = AirDropGnomeBridge {
         state: state.clone(),
@@ -360,7 +358,7 @@ pub async fn run(cfg: Config, mock_mode: bool) -> Result<()> {
                 tokio::spawn(async move {
                     let _ = radio_clone
                         .watch_state(move |_lease, new_state, reason| {
-                            let _ = ev_tx2.blocking_send(BridgeEvent::RadioStateChanged(
+                            let _ = ev_tx2.send(BridgeEvent::RadioStateChanged(
                                 new_state, reason,
                             ));
                         })
@@ -385,7 +383,7 @@ pub async fn run(cfg: Config, mock_mode: bool) -> Result<()> {
         });
         tokio::spawn(async move {
             while let Some(ev) = mock_rx.recv().await {
-                let _ = ev_tx2.send(BridgeEvent::MockEvent(ev)).await;
+                let _ = ev_tx2.send(BridgeEvent::MockEvent(ev));
             }
         });
     }
@@ -448,6 +446,14 @@ pub async fn run(cfg: Config, mock_mode: bool) -> Result<()> {
                 let cancel = CancellationToken::new();
                 browse_cancel = Some(cancel.clone());
                 let ev_tx_browse = ev_tx.clone();
+
+                // Only browse if the radio is already active (e.g. receiving is on or send is active)
+                // Never silently acquire the radio and kill the host network on browsing!
+                if current_lease_id.is_none() && !mock_mode {
+                    debug!("browse requested while radio is idle; skipping to protect host Wi-Fi");
+                    continue;
+                }
+
                 let iface_name = state.read().await.awdl_interface.clone().unwrap_or_else(|| "awdl0".into());
                 let display = cfg.display_name.clone();
 
@@ -459,7 +465,7 @@ pub async fn run(cfg: Config, mock_mode: bool) -> Result<()> {
                         let _ = owly_process::browse(&iface_name, 10, display.as_deref(), cancel_inner, btx2).await;
                     });
                     while let Some(bev) = brx.recv().await {
-                        let _ = ev_tx_browse.send(BridgeEvent::BrowseEvent(bev)).await;
+                        let _ = ev_tx_browse.send(BridgeEvent::BrowseEvent(bev));
                     }
                 });
             }
@@ -481,11 +487,19 @@ pub async fn run(cfg: Config, mock_mode: bool) -> Result<()> {
             }
 
             BridgeEvent::BrowseEvent(browse_ev) => {
+                let is_done = matches!(browse_ev, owly_process::BrowseEvent::Done | owly_process::BrowseEvent::Error(_));
                 handle_browse_event(browse_ev, &state, &iface_ref).await;
+                if is_done {
+                    maybe_release_idle_lease(&state, &radio_client, &mut current_lease_id, &iface_ref).await;
+                }
             }
 
             BridgeEvent::SendEvent { transfer_id, event } => {
+                let is_terminal = matches!(event, owly_process::SendEvent::Done | owly_process::SendEvent::Rejected | owly_process::SendEvent::Error(_));
                 handle_send_event(transfer_id, event, &state, &iface_ref).await;
+                if is_terminal {
+                    maybe_release_idle_lease(&state, &radio_client, &mut current_lease_id, &iface_ref).await;
+                }
             }
 
             BridgeEvent::ReceiveEvent(recv_ev) => {
@@ -624,7 +638,7 @@ async fn handle_set_receiving(
     cfg: &Config,
     state: &SharedState,
     iface_ref: &zbus::object_server::InterfaceRef<AirDropGnomeBridge>,
-    ev_tx: &mpsc::Sender<BridgeEvent>,
+    ev_tx: &mpsc::UnboundedSender<BridgeEvent>,
     radio_client: &Option<Arc<RadioClient>>,
     current_lease_id: &mut Option<u64>,
     receive_cancel: &mut Option<CancellationToken>,
@@ -721,31 +735,32 @@ async fn handle_set_receiving(
     let cancel = CancellationToken::new();
     *receive_cancel = Some(cancel.clone());
 
-    let ev_tx2 = ev_tx.clone();
     let dest_dir = cfg.receive_dir.clone();
     let display_name = cfg.display_name.clone();
     let port = cfg.receive_port;
 
-    tokio::spawn(async move {
-        match owly_process::start_receive(
-            &awdl_iface,
-            &dest_dir,
-            port,
-            display_name.as_deref(),
-            cancel,
-        )
-        .await
-        {
-            Ok((mut recv_rx, _accept_tx)) => {
+    match owly_process::start_receive(
+        &awdl_iface,
+        &dest_dir,
+        port,
+        display_name.as_deref(),
+        cancel,
+    )
+    .await
+    {
+        Ok((mut recv_rx, accept_tx)) => {
+            *receive_accept_tx = Some(accept_tx);
+            let ev_tx2 = ev_tx.clone();
+            tokio::spawn(async move {
                 while let Some(ev) = recv_rx.recv().await {
-                    let _ = ev_tx2.send(BridgeEvent::ReceiveEvent(ev)).await;
+                    let _ = ev_tx2.send(BridgeEvent::ReceiveEvent(ev));
                 }
-            }
-            Err(e) => {
-                error!("receive process failed: {e}");
-            }
+            });
         }
-    });
+        Err(e) => {
+            error!("receive process failed: {e}");
+        }
+    }
 }
 
 async fn handle_browse_event(
@@ -860,14 +875,76 @@ async fn handle_receive_event(
         }
         owly_process::ReceiveEvent::Accepted(offer_id, dest) => {
             debug!(offer_id, dest = %dest, "offer accepted, transfer starting");
+            let mut st = state.write().await;
+            st.transfers.insert(
+                offer_id,
+                Transfer {
+                    id: offer_id,
+                    direction: TransferDirection::Incoming,
+                    status: TransferStatus::Transferring,
+                    peer_name: "Nearby Device".into(),
+                    peer_id: String::new(),
+                    file_names: vec![],
+                    total_bytes: 0,
+                    transferred_bytes: 0,
+                    dest_dir: Some(dest),
+                    error: None,
+                },
+            );
         }
-        owly_process::ReceiveEvent::Progress(_offer_id, _sent, _total) => {
+        owly_process::ReceiveEvent::Progress(offer_id, sent, total) => {
+            let mut st = state.write().await;
+            if let Some(t) = st.transfers.get_mut(&offer_id) {
+                t.transferred_bytes = sent;
+                t.total_bytes = total;
+                t.status = TransferStatus::Transferring;
+            }
+            drop(st);
+            let st = state.read().await;
+            if let Some(t) = st.transfers.get(&offer_id) {
+                let dict = transfer_to_dict(t);
+                let _ = AirDropGnomeBridge::notify_transfer_progress(iface_ref.signal_context(), dict).await;
+            }
         }
         owly_process::ReceiveEvent::Done(offer_id) => {
-            state.write().await.pending_offers.remove(&offer_id);
+            {
+                let mut st = state.write().await;
+                st.pending_offers.remove(&offer_id);
+                if let Some(t) = st.transfers.get_mut(&offer_id) {
+                    t.status = TransferStatus::Completed;
+                }
+            }
+            let st = state.read().await;
+            if let Some(t) = st.transfers.get(&offer_id) {
+                let dict = transfer_to_dict(t);
+                let _ = AirDropGnomeBridge::notify_transfer_completed(iface_ref.signal_context(), dict).await;
+            }
         }
         owly_process::ReceiveEvent::Error(e) => {
             error!("receive error: {e}");
+        }
+    }
+}
+
+async fn maybe_release_idle_lease(
+    state: &SharedState,
+    radio_client: &Option<Arc<RadioClient>>,
+    current_lease_id: &mut Option<u64>,
+    iface_ref: &zbus::object_server::InterfaceRef<AirDropGnomeBridge>,
+) {
+    let should_release = {
+        let st = state.read().await;
+        st.visibility.mode == ReceivingMode::Off && st.transfers.values().all(|t| t.status.is_terminal())
+    };
+    if should_release {
+        if let (Some(radio), Some(lease)) = (radio_client.as_ref(), current_lease_id.take()) {
+            info!(lease, "releasing idle radio lease to restore normal Wi-Fi");
+            let _ = radio.release(lease).await;
+            {
+                let mut st = state.write().await;
+                st.radio = RadioState::Idle;
+            }
+            emit_radio_state(iface_ref, state).await;
         }
     }
 }
@@ -878,7 +955,7 @@ async fn start_send(
     peer_id: String,
     cfg: &Config,
     state: &SharedState,
-    ev_tx: &mpsc::Sender<BridgeEvent>,
+    ev_tx: &mpsc::UnboundedSender<BridgeEvent>,
     radio_client: &Option<Arc<RadioClient>>,
     current_lease_id: &mut Option<u64>,
     send_cancels: &mut HashMap<u32, CancellationToken>,
@@ -956,15 +1033,13 @@ async fn start_send(
                     .send(BridgeEvent::SendEvent {
                         transfer_id,
                         event: owly_process::SendEvent::Progress(total * i / 10, total),
-                    })
-                    .await;
+                    });
             }
             let _ = ev_tx2
                 .send(BridgeEvent::SendEvent {
                     transfer_id,
                     event: owly_process::SendEvent::Done,
-                })
-                .await;
+                });
         });
     } else {
         tokio::spawn(async move {
@@ -981,8 +1056,7 @@ async fn start_send(
             .await;
             while let Some(ev) = send_rx.recv().await {
                 let _ = ev_tx2
-                    .send(BridgeEvent::SendEvent { transfer_id, event: ev })
-                    .await;
+                    .send(BridgeEvent::SendEvent { transfer_id, event: ev });
             }
         });
     }

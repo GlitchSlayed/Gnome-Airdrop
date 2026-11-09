@@ -21,8 +21,31 @@ export const AirDropToggle = GObject.registerClass(class AirDropToggle extends Q
         this._proxy = null;
         this._proxySignals = [];
         this._consentDialog = null;
+        this._countdownTimer = null;
+        this._radioState = 'idle';
+        this._recvMode = 'off';
+        this._receivingExpiry = 0;
         // Header icon and title
         this.menu.setHeader(airdropGIcon, 'AirDrop');
+        // Click on main toggle to turn receiving on/off
+        this.connect('clicked', () => {
+            if (this._recvMode !== 'off') {
+                this._requestReceivingMode('off', 0);
+            }
+            else {
+                this._requestReceivingMode('timed', 600);
+            }
+        });
+        // Refresh on menu open, but never blindly seize radio if idle
+        this.menu.connect('open-state-changed', (_menu, isOpen) => {
+            if (isOpen) {
+                this._refreshState();
+                // Only browse if radio is ALREADY active!
+                if (this._radioState === 'active' && this._proxy) {
+                    this._proxy.BrowseRemote(() => { });
+                }
+            }
+        });
         this._buildMenu();
         this._connectProxy();
     }
@@ -156,18 +179,19 @@ export const AirDropToggle = GObject.registerClass(class AirDropToggle extends Q
         const radioState = state['radio_state'] ? state['radio_state'].deepUnpack() : 'idle';
         const recvMode = state['receiving_mode'] ? state['receiving_mode'].deepUnpack() : 'off';
         const expiry = state['receiving_expiry'] ? state['receiving_expiry'].deepUnpack() : 0;
-        let modeText = 'Off';
-        if (recvMode === 'timed') {
-            const remaining = Math.max(0, expiry - Math.floor(Date.now() / 1000));
-            const mins = Math.ceil(remaining / 60);
-            modeText = `On (${mins}m remaining)`;
-        }
-        else if (recvMode === 'always') {
-            modeText = 'Always on';
-        }
-        this._visibilityMenu.label.text = `Receiving: ${modeText}`;
-        this.subtitle = recvMode === 'off' ? 'Off' : modeText;
+        this._radioState = radioState;
+        this._recvMode = recvMode;
+        this._receivingExpiry = expiry;
         this.checked = recvMode !== 'off';
+        if (recvMode === 'timed' && expiry > 0) {
+            this._startCountdownTimer();
+        }
+        else {
+            this._stopCountdownTimer();
+            let modeText = recvMode === 'always' ? 'Always on' : 'Off';
+            this._visibilityMenu.label.text = `Receiving: ${modeText}`;
+            this.subtitle = modeText;
+        }
         if (radioState === 'active') {
             this._statusItem.label.text = 'Radio Active (AirDrop Ready)';
         }
@@ -178,7 +202,50 @@ export const AirDropToggle = GObject.registerClass(class AirDropToggle extends Q
             this._statusItem.label.text = 'Restoring normal Wi-Fi…';
         }
         else {
-            this._statusItem.label.text = 'Radio Idle';
+            this._statusItem.label.text = 'Radio Idle (Wi-Fi Normal)';
+        }
+        this._updateNoPeersMessage();
+    }
+    _startCountdownTimer() {
+        this._updateCountdown();
+        if (!this._countdownTimer) {
+            this._countdownTimer = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, 1, () => {
+                return this._updateCountdown();
+            });
+        }
+    }
+    _stopCountdownTimer() {
+        if (this._countdownTimer) {
+            GLib.source_remove(this._countdownTimer);
+            this._countdownTimer = null;
+        }
+    }
+    _updateCountdown() {
+        if (this._recvMode !== 'timed') {
+            this._stopCountdownTimer();
+            return GLib.SOURCE_REMOVE;
+        }
+        const remaining = Math.max(0, this._receivingExpiry - Math.floor(Date.now() / 1000));
+        if (remaining <= 0) {
+            this._stopCountdownTimer();
+            this._refreshState();
+            return GLib.SOURCE_REMOVE;
+        }
+        const mins = Math.floor(remaining / 60);
+        const secs = remaining % 60;
+        const timeStr = `${mins}m ${secs < 10 ? '0' : ''}${secs}s`;
+        this._visibilityMenu.label.text = `Receiving: On (${timeStr} remaining)`;
+        this.subtitle = `On (${timeStr})`;
+        return GLib.SOURCE_CONTINUE;
+    }
+    _updateNoPeersMessage() {
+        if (this._peers.size === 0 && this._noPeersItem) {
+            if (this._radioState === 'active') {
+                this._noPeersItem.label.text = 'Scanning for AirDrop devices…';
+            }
+            else {
+                this._noPeersItem.label.text = 'AirDrop is Off (turn on receiving to discover)';
+            }
         }
     }
     _onPeerAdded(peerMap) {
@@ -344,6 +411,7 @@ export const AirDropToggle = GObject.registerClass(class AirDropToggle extends Q
         }
     }
     destroy() {
+        this._stopCountdownTimer();
         if (this._proxy && this._proxySignals) {
             for (const id of this._proxySignals) {
                 try {

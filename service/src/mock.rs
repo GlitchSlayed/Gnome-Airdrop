@@ -8,7 +8,7 @@ use tokio::sync::mpsc;
 use tokio::time::sleep;
 use tracing::info;
 
-use crate::state::{IncomingOffer, Peer, Transfer, TransferDirection, TransferStatus};
+use crate::state::{IncomingOffer, Peer};
 
 /// Events that the mock backend emits to the bridge event loop
 #[derive(Debug)]

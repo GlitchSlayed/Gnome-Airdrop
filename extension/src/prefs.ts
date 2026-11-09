@@ -7,6 +7,8 @@ import { ExtensionPreferences } from 'resource:///org/gnome/Shell/Extensions/js/
 import { AirDropProxy, AIRDROP_BUS_NAME, AIRDROP_OBJECT_PATH } from './dbus.js';
 
 export default class AirDropPreferences extends ExtensionPreferences {
+  [key: string]: any;
+
   fillPreferencesWindow(window) {
     const settings = this.getSettings();
 

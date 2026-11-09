@@ -406,5 +406,14 @@ fn parse_receive_line(line: &str, offer_counter: &mut u32) -> Option<ReceiveEven
         return Some(ReceiveEvent::Error(rest.trim().to_string()));
     }
 
+    if line.contains("the request was withdrawn") {
+        return Some(ReceiveEvent::Error("Request was withdrawn by sender".to_string()));
+    }
+
+    // Completed file path printed to stdout by owly receive (e.g. "/home/user/Downloads/img.png")
+    if (line.starts_with('/') || line.starts_with("./")) && !line.contains("wants to") && !line.contains(':') {
+        return Some(ReceiveEvent::Done(*offer_counter));
+    }
+
     None
 }
