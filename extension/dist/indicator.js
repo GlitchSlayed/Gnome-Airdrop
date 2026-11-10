@@ -155,8 +155,18 @@ export const AirDropToggle = GObject.registerClass(class AirDropToggle extends Q
         });
         this._proxy.GetPeersRemote((res, err) => {
             if (!err && res) {
+                const livePeerIds = new Set();
                 for (const peer of res[0]) {
-                    this._onPeerAdded(peer);
+                    const id = peer['id'] ? peer['id'].deepUnpack() : '';
+                    if (id) {
+                        livePeerIds.add(id);
+                        this._onPeerAdded(peer);
+                    }
+                }
+                for (const [id] of this._peers) {
+                    if (!livePeerIds.has(id)) {
+                        this._onPeerRemoved(id);
+                    }
                 }
             }
         });
@@ -204,6 +214,19 @@ export const AirDropToggle = GObject.registerClass(class AirDropToggle extends Q
         else {
             this._statusItem.label.text = 'Radio Idle (Wi-Fi Normal)';
         }
+        if (radioState !== 'active') {
+            this._clearAllPeers();
+        }
+        this._updateNoPeersMessage();
+    }
+    _clearAllPeers() {
+        for (const [id, peer] of this._peers) {
+            try {
+                peer.item.destroy();
+            }
+            catch (_) { }
+        }
+        this._peers.clear();
         this._updateNoPeersMessage();
     }
     _startCountdownTimer() {
